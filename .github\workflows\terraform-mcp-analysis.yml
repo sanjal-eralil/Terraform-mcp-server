@@ -1,0 +1,147 @@
+name: Terraform Q Minimal Analysis
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  analyze:
+    runs-on:
+      group: mcp-server
+    timeout-minutes: 25
+    steps:
+      - name: Validate runner identity
+        run: |
+          echo "Runner name: $RUNNER_NAME"
+          echo "Runner labels JSON:" 
+          echo '${{ toJson(runner) }}'
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Amazon Q environment (force ubuntu user context)
+        run: |
+          set -e
+          echo "Switching to /home/ubuntu environment..."
+          export HOME=/home/ubuntu
+          export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export AMAZONQ_HOME="$HOME/.aws/amazonq"
+          mkdir -p "$AMAZONQ_HOME"
+
+          echo "HOME is now $HOME"
+          echo "PATH is $PATH"
+
+          # Verify Q CLI and uv presence
+          if ! command -v q >/dev/null 2>&1; then
+            echo "Amazon Q CLI not found. Check that it's installed under ubuntu." >&2
+            exit 1
+          fi
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "Warning: uv not found on PATH ($PATH)" >&2
+          fi
+
+          echo "Q CLI location: $(which q)"
+          echo "UV location: $(which uv)"
+          echo "Python3: $(which python3)"
+
+          # Ensure credentials exist
+          CACHEDIR="$HOME/.local/share/amazon-q"
+          if [[ ! -f "$CACHEDIR/data.sqlite3" || ! -f "$CACHEDIR/settings.json" ]]; then
+            echo "❌ Missing Amazon Q cached credentials under ubuntu. Please run 'sudo -u ubuntu q login' once manually." >&2
+            exit 1
+          fi
+
+          # Copy MCP configuration
+          SRC_CFG="mcp-servers/mcp.json"
+          DEST_CFG="$AMAZONQ_HOME/mcp.json"
+          if [[ -f "$SRC_CFG" ]]; then
+            echo "Copying repo MCP config to $DEST_CFG"
+            cp "$SRC_CFG" "$DEST_CFG"
+            chmod 600 "$DEST_CFG"
+          else
+            echo "WARNING: $SRC_CFG not found; continuing with any existing config."
+          fi
+
+          echo "✅ Amazon Q CLI, env, and MCP config prepared for ubuntu user."
+
+      - name: Show effective MCP config
+        run: |
+          export HOME=/home/ubuntu
+          FILE="$HOME/.aws/amazonq/mcp.json"
+          if [[ -f "$FILE" ]]; then
+            echo '--- Effective mcp.json ---'
+            cat "$FILE"
+          else
+            echo 'No MCP config present after copy step.' >&2
+          fi
+
+      - name: List Terraform files
+        id: tffiles
+        run: |
+          COUNT=$(find . -type f -name '*.tf' | wc -l)
+          echo "Terraform file count: $COUNT"
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          if [[ $COUNT -eq 0 ]]; then
+            echo "No Terraform files found; exiting early." >&2
+            exit 1
+          fi
+
+      - name: Run Amazon Q analysis (ubuntu home forced)
+        env:
+          AWS_REGION: us-east-1
+          HOME: /home/ubuntu
+          PATH: /home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+        run: |
+          PROMPT="Review all Terraform (*.tf) files for AWS security best practices (encryption, IAM least privilege, network segmentation, logging, tagging, cost optimization). Summarize CRITICAL/HIGH first with file:line references if possible, then improvements."
+          echo "Running Q analysis under ubuntu home: $HOME"
+          set -o pipefail
+          q chat "$PROMPT" --no-interactive --trust-all-tools > q_analysis.txt 2> q_chat.stderr || {
+            echo 'Amazon Q chat command failed. Stderr:' >&2
+            cat q_chat.stderr >&2
+            exit 1
+          }
+          echo " Analysis written to q_analysis.txt"
+
+      - name: Format Q analysis output
+        run: |
+          chmod +x bash_scripts/format_q_analysis.sh
+          bash_scripts/format_q_analysis.sh q_analysis.txt q_analysis_report.md
+          echo "Formatted Markdown report generated: q_analysis_report.md"
+
+      - name: Upload analysis artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amazon-q-terraform-analysis
+          path: q_analysis_report.md
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-and-q-logs
+          path: q_chat.stderr
+
+      - name: Job summary
+        run: |
+          echo "Terraform files analyzed: ${{ steps.tffiles.outputs.count }}" | tee -a $GITHUB_STEP_SUMMARY
+          echo "Artifact: amazon-q-terraform-analysis" | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Purge cloned repository workspace
+        if: always()
+        run: |
+          set -e
+          echo "Purging repository working directory: $GITHUB_WORKSPACE"
+          case "$GITHUB_WORKSPACE" in
+            ""|"/"|"/home"|"/root"|"/usr"|"/var"|"/etc"|"/bin"|"/sbin") echo "Refusing to purge suspicious directory $GITHUB_WORKSPACE" >&2; exit 1 ;;
+          esac
+          cd "$GITHUB_WORKSPACE"
+          echo "Disk usage BEFORE:"
+          du -sh . || true
+          rm -rf -- * .[^.]* 2>/dev/null || true
+          ls -al || true
+          echo "Disk usage AFTER:"
+          du -sh . || true
+          echo "Workspace purge complete."
